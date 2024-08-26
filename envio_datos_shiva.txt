@@ -1,0 +1,120 @@
+import json
+import os
+import time
+import paramiko
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Configuración de la conexión SSH
+REMOTE_HOST = '192.168.10.102'
+REMOTE_USERNAME = 'idps-cti'
+REMOTE_PASSWORD = 'idps-cti'
+REMOTE_PATH = '/home/idps-cti/reporte-tpot/email.txt'
+
+# Ruta local donde se encuentran los archivos de Shiva Receiver
+LOCAL_PATH = '/var/lib/docker/volumes/spam_queue/_data'
+
+def send_to_remote(data):
+    # Crear una conexión SSH
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(REMOTE_HOST, username=REMOTE_USERNAME, password=REMOTE_PASSWORD)
+
+    # Abrir una sesión SFTP
+    sftp = ssh.open_sftp()
+
+    try:
+        # Abrir el archivo remoto en modo append
+        with sftp.file(REMOTE_PATH, 'a') as f:
+            # Escribir el JSON como una nueva línea
+            f.write(json.dumps(data) + '\n')
+    finally:
+        sftp.close()
+        ssh.close()
+
+class ShivaHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith('.meta'):
+            # Obtener la ruta del archivo .meta
+            meta_path = event.src_path
+
+            # Esperar a que el archivo .meta esté disponible
+            while not os.path.exists(meta_path):
+                time.sleep(0.1)
+
+            # Leer el contenido del archivo .meta
+            try:
+                with open(meta_path, 'r') as meta_file:
+                    meta_content = meta_file.read().strip()
+                    print(f"Contenido del archivo .meta: {meta_content}")  # Depuración
+                    if not meta_content:
+                        print(f"El archivo .meta está vacío: {meta_path}")
+                        return
+
+                    # Intentar cargar el JSON
+                    try:
+                        meta_content = json.loads(meta_content)
+                    except json.JSONDecodeError:
+                        # Si falla, intentar eliminar caracteres no imprimibles y volver a cargar
+                        meta_content = ''.join(char for char in meta_content if char.isprintable())
+                        meta_content = json.loads(meta_content)
+            except json.JSONDecodeError as e:
+                print(f"Error al decodificar JSON del archivo .meta: {meta_path}")
+                print(f"Error: {str(e)}")
+                return
+            except Exception as e:
+                print(f"Error al leer el archivo .meta: {meta_path}")
+                print(f"Error: {str(e)}")
+                return
+
+            # Obtener el sha256 del meta para buscar el archivo .eml correspondiente
+            sha256 = meta_content.get('sha256')
+            if sha256:
+                eml_path = os.path.join(os.path.dirname(meta_path), f"{sha256}.eml")
+
+                # Esperar a que el archivo .eml esté disponible
+                timeout = 60  # Esperar hasta 60 segundos
+                start_time = time.time()
+                while not os.path.exists(eml_path):
+                    if time.time() - start_time > timeout:
+                        print(f"Tiempo de espera agotado para el archivo .eml: {eml_path}")
+                        return
+                    time.sleep(0.1)
+
+                # Leer el contenido del archivo .eml
+                try:
+                    with open(eml_path, 'r', encoding='utf-8', errors='ignore') as eml_file:
+                        eml_content = eml_file.read()
+
+                    # Agregar el contenido del .eml al objeto meta
+                    meta_content['eml_content'] = eml_content
+                except Exception as e:
+                    print(f"Error al leer el archivo .eml: {eml_path}")
+                    print(f"Error: {str(e)}")
+                    return
+            else:
+                print(f"No se encontró 'sha256' en el archivo .meta: {meta_path}")
+                return
+
+            # Enviar los datos a la computadora remota
+            try:
+                send_to_remote(meta_content)
+                print(f"Datos enviados exitosamente para: {meta_path}")
+            except Exception as e:
+                print(f"Error al enviar datos a la computadora remota")
+                print(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    event_handler = ShivaHandler()
+    observer = Observer()
+    observer.schedule(event_handler, LOCAL_PATH, recursive=False)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()

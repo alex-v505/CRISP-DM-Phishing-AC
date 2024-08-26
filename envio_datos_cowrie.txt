@@ -1,0 +1,80 @@
+import json
+import os
+import time
+import paramiko
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# Configuración de la conexión SSH
+REMOTE_HOST = '192.168.10.102'
+REMOTE_USERNAME = 'idps-cti'
+REMOTE_PASSWORD = 'idps-cti'
+REMOTE_PATH = '/home/idps-cti/reporte-tpot/ssh-telnet.json'
+
+# Ruta local donde se encuentran los archivos de Cowrie
+LOCAL_PATH = '/home/tsec/tpotce/data/cowrie/log'
+COWRIE_FILE = 'cowrie.json'
+
+def send_to_remote(data):
+    # Crear una conexión SSH
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(REMOTE_HOST, username=REMOTE_USERNAME, password=REMOTE_PASSWORD)
+
+    # Abrir una sesión SFTP
+    sftp = ssh.open_sftp()
+    try:
+        # Convertir el dato a una línea JSON
+        json_line = json.dumps(data) + '\n'
+
+        # Abrir el archivo remoto en modo append
+        with sftp.file(REMOTE_PATH, 'a') as f:
+            f.write(json_line)
+
+        print(f"Dato añadido al archivo JSON en {REMOTE_PATH}")
+    finally:
+        sftp.close()
+        ssh.close()
+
+class CowrieHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.last_position = 0
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.endswith(COWRIE_FILE):
+            self.process_cowrie_file(event.src_path)
+
+    def process_cowrie_file(self, file_path):
+        try:
+            with open(file_path, 'r') as json_file:
+                json_file.seek(self.last_position)
+                for line in json_file:
+                    line = line.strip()
+                    if line:
+                        try:
+                            cowrie_data = json.loads(line)
+                            send_to_remote(cowrie_data)
+                            print(f"Datos enviados: {cowrie_data.get('eventid', 'Unknown event')}")
+                        except json.JSONDecodeError as e:
+                            print(f"Error al decodificar JSON: {line}")
+                            print(f"Error: {str(e)}")
+                self.last_position = json_file.tell()
+        except Exception as e:
+            print(f"Error al procesar el archivo Cowrie: {file_path}")
+            print(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    event_handler = CowrieHandler()
+    observer = Observer()
+    observer.schedule(event_handler, LOCAL_PATH, recursive=False)
+    observer.start()
+    print(f"Monitoreando el archivo: {os.path.join(LOCAL_PATH, COWRIE_FILE)}")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
